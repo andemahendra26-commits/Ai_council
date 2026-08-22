@@ -31,6 +31,15 @@ STYLE = (
 
 RANK_TITLE = {"leader": "Leader", "minister": "Minister", "member": "Member"}
 
+# How many seats may stream at once. A full roster fanning out unthrottled is
+# the quickest way to trip NIM's per-key rate limit, and a 429 costs a whole
+# seat's turn - far more than the few seconds queueing adds.
+DEFAULT_CONCURRENCY = 6
+
+# Bytes-per-token used only for the fallback estimate, when the endpoint does
+# not report real usage. Good enough for "roughly what did this session cost".
+CHARS_PER_TOKEN = 4
+
 
 def letter_for(index: int) -> str:
     """A, B, … Z, then AA, AB, … — letters must stay unique or seats collide."""
@@ -104,6 +113,34 @@ class Ctx:
         self._letters[chair.id] = "L"
         self.log: list[dict[str, str]] = []  # everything said, in order
         self.timings: dict[str, float] = {}  # seat id -> seconds, successful turns only
+        gate = int(self.options.get("concurrency") or DEFAULT_CONCURRENCY)
+        self._gate = asyncio.Semaphore(max(1, gate))
+        # Session accounting, reported on run_end.
+        self.calls = 0     # model calls attempted
+        self.failures = 0  # calls that raised
+        self.chars_in = 0  # prompt characters sent
+        self.chars_out = 0  # answer + reasoning characters received
+        self.usage: dict[str, int] = {}  # real token counts, when reported
+
+    def usage_report(self) -> dict[str, Any]:
+        """What this session cost, as far as the endpoint lets us tell."""
+        report: dict[str, Any] = {
+            "calls": self.calls,
+            "failures": self.failures,
+            "chars_in": self.chars_in,
+            "chars_out": self.chars_out,
+        }
+        if self.usage:
+            report["tokens"] = dict(self.usage)
+            report["tokens_estimated"] = False
+        else:
+            report["tokens"] = {
+                "prompt_tokens": self.chars_in // CHARS_PER_TOKEN,
+                "completion_tokens": self.chars_out // CHARS_PER_TOKEN,
+                "total_tokens": (self.chars_in + self.chars_out) // CHARS_PER_TOKEN,
+            }
+            report["tokens_estimated"] = True
+        return report
 
     # -- roster helpers -------------------------------------------------
     def label(self, seat: Seat) -> str:
@@ -163,15 +200,20 @@ class Ctx:
             return "(nothing on the record yet)"
         return "\n\n".join(f"--- {r['who']} ({r['stage']}) ---\n\n{r['text']}" for r in rows if r["text"])
 
-    @staticmethod
-    def block(answers: dict[str, str], seats: list[Seat], ctx: "Ctx", skip: str | None = None) -> str:
+    def block(
+        self,
+        answers: dict[str, str],
+        seats: list[Seat] | None = None,
+        skip: str | None = None,
+    ) -> str:
+        """Answers laid out one labelled section per seat, ready for a prompt."""
         out = []
-        for seat in seats:
+        for seat in seats if seats is not None else self.seats:
             if seat.id == skip:
                 continue
             text = (answers.get(seat.id) or "").strip()
             if text:
-                out.append(f"--- {ctx.label(seat)} — {seat.name} ---\n\n{text}")
+                out.append(f"--- {self.label(seat)} — {seat.name} ---\n\n{text}")
         return "\n\n".join(out) if out else "(no statements were returned)"
 
     # -- event verbs ----------------------------------------------------
@@ -190,35 +232,48 @@ class Ctx:
 
     async def speak(self, seat: Seat, round_name: str, system: str, user: str) -> str:
         """Stream one seat's turn into the UI and onto the record."""
-        started = time.perf_counter()
+        messages = build_messages(seat, system, user)
         parts: list[str] = []
         reasoning: list[str] = []
         finish = ""
-        try:
-            messages = build_messages(seat, system, user)
-            async for kind, text in stream_chat(self.client, seat, messages):
-                if kind == "finish":
-                    finish = text
-                    continue
-                (parts if kind == "content" else reasoning).append(text)
+
+        # Queue behind the concurrency gate before starting the clock, so
+        # `elapsed` measures the model rather than the wait for a free slot.
+        async with self._gate:
+            started = time.perf_counter()
+            self.calls += 1
+            self.chars_in += sum(len(m.get("content") or "") for m in messages)
+            try:
+                async for kind, text in stream_chat(self.client, seat, messages):
+                    if kind == "finish":
+                        finish = text
+                        continue
+                    if kind == "usage":
+                        for field, value in (text or {}).items():
+                            if isinstance(value, int):
+                                self.usage[field] = self.usage.get(field, 0) + value
+                        continue
+                    (parts if kind == "content" else reasoning).append(text)
+                    await self.emit(
+                        {"type": "delta", "seat": seat.id, "round": round_name, "kind": kind, "text": text}
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # one seat failing must not end the session
+                self.failures += 1
                 await self.emit(
-                    {"type": "delta", "seat": seat.id, "round": round_name, "kind": kind, "text": text}
+                    {
+                        "type": "seat_error",
+                        "seat": seat.id,
+                        "round": round_name,
+                        "message": f"{type(exc).__name__}: {exc}",
+                    }
                 )
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:  # one seat failing must not end the session
-            await self.emit(
-                {
-                    "type": "seat_error",
-                    "seat": seat.id,
-                    "round": round_name,
-                    "message": f"{type(exc).__name__}: {exc}",
-                }
-            )
-            return ""
+                return ""
+            elapsed = time.perf_counter() - started
 
         answer = "".join(parts).strip()
-        elapsed = time.perf_counter() - started
+        self.chars_out += len(answer) + len("".join(reasoning))
         if not answer and finish == "length":
             # The whole budget went on thinking — say so rather than returning
             # an empty turn that the next round would silently work from.

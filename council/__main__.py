@@ -33,6 +33,15 @@ def main() -> None:
     if not os.environ.get("NVIDIA_API_KEY"):
         print("  !  NVIDIA_API_KEY is not set - put your key in .env before convening.\n")
 
+    if args.host not in ("127.0.0.1", "localhost", "::1"):
+        # No route on this app is authenticated. Anyone who can reach the port
+        # can spend the operator's NVIDIA key, and since the roster arrives
+        # from the client, they also choose the models it is spent on.
+        print(f"  !  Binding {args.host}, not loopback. This app has NO authentication:")
+        print("     anyone who can reach this port can spend your NVIDIA_API_KEY.")
+        print("     Only do this on a network you trust.")
+        print("")
+
     if not args.no_open:
         threading.Timer(1.5, lambda: webbrowser.open(url)).start()
 

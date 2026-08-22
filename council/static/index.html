@@ -276,6 +276,21 @@
     font: 11.5px var(--mono); background: rgba(255, 182, 72, 0.08);
   }
   /* fast-mode toggle */
+  .knob { display: flex; align-items: center; gap: 8px; }
+  .knob input {
+    width: 52px; background: rgba(3,6,12,0.7); color: var(--hud);
+    border: 1px solid var(--hud-faint); padding: 3px 5px; font: 11px var(--mono);
+  }
+  .arch { display: flex; flex-direction: column; gap: 1px; }
+  .archrow {
+    display: flex; align-items: baseline; gap: 12px; padding: 8px 10px; cursor: pointer;
+    border: 1px solid transparent; border-left: 2px solid var(--hud-faint); text-align: left;
+    background: none; color: var(--text); font: inherit; text-transform: none; letter-spacing: 0;
+  }
+  .archrow:hover { border-color: var(--hud-faint); border-left-color: var(--hud); background: rgba(127,233,255,0.04); }
+  .archrow .aq { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; }
+  .archrow .am { font: 10px var(--mono); color: var(--muted); white-space: nowrap; }
+  .archempty { padding: 10px; font: 11px var(--mono); color: var(--muted); }
   .fast-wrap { display: flex; align-items: center; gap: 7px; font: 10.5px var(--mono); color: var(--muted); cursor: pointer; }
   .fast-wrap input { accent-color: var(--amber); cursor: pointer; }
   .fast-wrap.on { color: var(--amber); }
@@ -366,6 +381,10 @@
     <span class="nm" id="protoName"></span>
     <span class="what" id="protoWhat"></span>
     <span class="spacer"></span>
+    <label class="knob" id="knobWrap" hidden>
+      <span class="lab" id="knobLabel"></span>
+      <input type="number" id="knob" min="1" max="8" step="1" value="2">
+    </label>
     <span class="shape" id="protoShape"></span>
   </div>
 
@@ -420,6 +439,11 @@
   <details class="logWrap frame" id="logWrap">
     <summary>Full transcript &mdash; every seat, every round</summary>
     <div id="out"></div>
+  </details>
+
+  <details class="logWrap frame" id="archiveWrap">
+    <summary>Archive &mdash; past sessions</summary>
+    <div id="archive"></div>
   </details>
   <div class="foot" id="foot"></div>
 </div>
@@ -608,11 +632,37 @@ function drawPicker() {
     grid.appendChild(b);
   });
 }
+/* Four protocols loop, and each reads a differently-named option. The server
+   defaults them when absent, so the knob only appears for those four. */
+const PROTOCOL_KNOB = {
+  a2a:          { key: "sweeps",    label: "sweeps",  def: 2, max: 5 },
+  swarm:        { key: "max_steps", label: "steps",   def: 5, max: 8 },
+  blackboard:   { key: "passes",    label: "passes",  def: 2, max: 5 },
+  event_driven: { key: "waves",     label: "waves",   def: 2, max: 4 },
+};
 function applyPattern() {
   $("#protoStrip").hidden = false;
   $("#protoName").textContent = PATTERN.name;
   $("#protoWhat").textContent = PATTERN.what;
   $("#protoShape").innerHTML = diagramFor(PATTERN.id);
+
+  const knob = PROTOCOL_KNOB[PATTERN.id];
+  $("#knobWrap").hidden = !knob;
+  if (knob) {
+    $("#knobLabel").textContent = knob.label;
+    const input = $("#knob");
+    input.max = String(knob.max);
+    input.value = String(knob.def);
+    input.title = `How many ${knob.label} this protocol runs before the leader rules.`;
+  }
+}
+/* The options payload for the run about to start. */
+function protocolOptions() {
+  const knob = PROTOCOL_KNOB[PATTERN.id];
+  if (!knob) return {};
+  const n = parseInt($("#knob").value, 10);
+  if (!Number.isFinite(n) || n < 1) return {};
+  return { [knob.key]: Math.min(n, knob.max) };
 }
 function openPicker(first) {
   $("#overlay").hidden = false;
@@ -839,10 +889,19 @@ function handle(ev, ctx) {
       c.body.innerHTML = `<div class="errbox">${esc(ev.message)}</div>`;
       break;
     }
-    case "run_end":
-      $("#foot").textContent =
-        `session closed · ${ev.elapsed}s` + (ev.saved_to ? ` · archived to ${ev.saved_to}` : "");
+    case "run_end": {
+      const u = ev.usage || {};
+      const tok = u.tokens || {};
+      const bits = [`session closed · ${ev.elapsed}s`];
+      if (u.calls) bits.push(`${u.calls} model call${u.calls > 1 ? "s" : ""}`);
+      if (u.failures) bits.push(`${u.failures} failed`);
+      if (tok.total_tokens) {
+        bits.push(`${u.tokens_estimated ? "~" : ""}${tok.total_tokens.toLocaleString()} tokens`);
+      }
+      if (ev.saved_to) bits.push(`archived to ${ev.saved_to}`);
+      $("#foot").textContent = bits.join(" · ");
       if (ev.build_files) offerBuildZip(ev.build_files, ctx.question);
+      archiveLoaded = false;  // a new session is now on disk
       // Collapse the log drawer and jump straight to the verdict.
       setTimeout(() => {
         $("#logWrap").open = false;
@@ -850,6 +909,7 @@ function handle(ev, ctx) {
         if (vp && !vp.hidden) vp.scrollIntoView({ behavior: "smooth", block: "start" });
       }, 400);
       break;
+    }
     case "fatal": {
       const box = document.createElement("div");
       box.className = "fatal"; box.textContent = "⚠ " + ev.message;
@@ -879,6 +939,60 @@ function offerBuildZip(files, question) {
   downloadBlob(zipSync(files), zipName);
 }
 
+/* ============ archive of past sessions ============ */
+let archiveLoaded = false;
+
+async function loadArchive() {
+  if (archiveLoaded) return;
+  archiveLoaded = true;
+  const box = $("#archive");
+  box.innerHTML = `<div class="archempty">reading transcripts…</div>`;
+  let rows = [];
+  try {
+    rows = (await (await fetch("/api/transcripts")).json()).transcripts || [];
+  } catch {
+    box.innerHTML = `<div class="archempty">could not read the archive</div>`;
+    return;
+  }
+  if (!rows.length) {
+    box.innerHTML = `<div class="archempty">no sessions archived yet — untick "archive transcript" to stop saving them</div>`;
+    return;
+  }
+  const list = document.createElement("div");
+  list.className = "arch";
+  rows.forEach((r) => {
+    const when = r.name.slice(0, 4) + "-" + r.name.slice(4, 6) + "-" + r.name.slice(6, 8)
+               + " " + r.name.slice(9, 11) + ":" + r.name.slice(11, 13);
+    const meta = [when, r.pattern, r.seats ? `${r.seats} seats` : "", r.elapsed ? `${r.elapsed}s` : ""]
+      .filter(Boolean).join(" · ");
+    const row = document.createElement("button");
+    row.className = "archrow";
+    row.type = "button";
+    row.innerHTML = `<span class="aq">${esc(r.question)}</span><span class="am">${esc(meta)}</span>`;
+    row.onclick = () => openArchived(r.name, r.question);
+    list.appendChild(row);
+  });
+  box.innerHTML = "";
+  box.appendChild(list);
+}
+
+async function openArchived(name, question) {
+  try {
+    const data = await (await fetch(`/api/transcripts/${encodeURIComponent(name)}`)).json();
+    if (!data.markdown) throw new Error(data.error || "empty transcript");
+    const panel = $("#verdictPanel");
+    panel.hidden = false;
+    panel.querySelector(".lab").textContent = "Archived session";
+    $("#verdictBody").innerHTML = md(data.markdown);
+    panel.scrollIntoView({ behavior: "smooth", block: "start" });
+  } catch (err) {
+    $("#archive").insertAdjacentHTML("afterbegin",
+      `<div class="archempty" style="color:var(--err)">could not open ${esc(name)}: ${esc(String(err))}</div>`);
+  }
+}
+
+$("#archiveWrap").addEventListener("toggle", (e) => { if (e.target.open) loadArchive(); });
+
 /* ============ session ============ */
 async function convene() {
   const question = $("#q").value.trim();
@@ -889,6 +1003,8 @@ async function convene() {
   cards.clear(); phases.clear(); live.clear(); phaseNo = 0;
   Tree.reset();
   $("#dlBuild").hidden = true;
+  $("#verdictPanel").querySelector(".lab").textContent = "Leader's verdict";
+  $("#archiveWrap").open = false;
   $("#rosterWrap").open = false;
   $("#logWrap").open = false;
   setRunning(true);
@@ -914,7 +1030,8 @@ async function convene() {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        question, pattern: PATTERN.id, seats: fastSeats, chair: fastChair, save: $("#save").checked,
+        question, pattern: PATTERN.id, seats: fastSeats, chair: fastChair,
+        save: $("#save").checked, options: protocolOptions(),
       }),
       signal: controller.signal,
     });

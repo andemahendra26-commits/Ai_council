@@ -1,10 +1,10 @@
 # Alfredo Council
 
-An AI council: **14 different models** from the NVIDIA NIM catalog deliberate on
-your question under one of **11 multi-agent coordination protocols**, and a
-council leader delivers the verdict. Everything streams live to a HUD-style web
-UI — every model's reasoning as it forms, drawn as a topology of the protocol
-actually being run.
+An AI council: **a dozen different models** from the NVIDIA NIM catalog
+deliberate on your question under one of **11 multi-agent coordination
+protocols**, and a council leader delivers the verdict. Everything streams live
+to a HUD-style web UI — every model's reasoning as it forms, drawn as a topology
+of the protocol actually being run.
 
 ```
 run_council.bat          # first run installs everything, then opens the browser
@@ -20,22 +20,26 @@ Rank comes from `.env`, not from code:
 | --- | --- | --- |
 | **Leader** | 1 | Chairs every session and writes the final verdict |
 | **Ministers** | 3 | Senior seats — the leader weighs their judgement heavily |
-| **Members** | 10 | The base of the council |
-| **Bench** | 14 | Listed in the UI roster, unseated until you tick them |
+| **Members** | 9 | The base of the council |
+| **Bench** | 20 | Listed in the UI roster, unseated until you tick them |
 
 ```dotenv
-COUNCIL_LEADER=nvidia/nemotron-3-ultra-550b-a55b
-COUNCIL_MINISTERS=openai/gpt-oss-120b,z-ai/glm-5.2,nvidia/nemotron-3-super-120b-a12b
-COUNCIL_MEMBERS=moonshotai/kimi-k2.6,deepseek-ai/deepseek-v4-flash-0731,...
-COUNCIL_BENCH=nvidia/llama-3.1-nemotron-ultra-253b-v1,...
+COUNCIL_LEADER=z-ai/glm-5.2
+COUNCIL_MINISTERS=openai/gpt-oss-120b,nvidia/nemotron-3-super-120b-a12b,moonshotai/kimi-k2.6
+COUNCIL_MEMBERS=deepseek-ai/deepseek-v4-flash-0731,minimaxai/minimax-m3,...
+COUNCIL_BENCH=nvidia/nemotron-3-ultra-550b-a55b,...
 ```
 
 Move a model between lists to change its rank. Any id from
 `python -m council.models` works, and every seat's model can also be re-pointed
 from the browser without touching a file.
 
-The leader is the largest model on the catalog but speaks only once, at
-synthesis time, so its latency is paid once rather than in every round.
+**The leader is not the biggest model on the catalog, deliberately.**
+`nemotron-3-ultra-550b` was the original chair and proved unreliable under load
+— an outright connection failure, and a live run where it spent its whole token
+budget reasoning and returned nothing. GLM-5.2 answered fast and well in every
+test, so it chairs; the 550B sits on the bench. A model must never be both the
+leader and a seat, or the verdict weighs an argument the leader itself made.
 
 ## The 11 protocols
 
@@ -60,6 +64,10 @@ re-routes on the model's own JSON decision, swarm lets the current holder choose
 its successor, hierarchical uses the council's own org chart, and the event bus
 dispatches follow-up events emitted by handlers.
 
+Four of them loop, and the protocol strip shows a knob for how many times:
+A2A **sweeps**, swarm **steps**, blackboard **passes**, event-driven **waves**.
+More is slower and usually better.
+
 ## The council floor
 
 Send a question and the UI becomes a live topology of the chosen protocol:
@@ -69,6 +77,8 @@ Send a question and the UI becomes a live topology of the chosen protocol:
 - in tiered protocols the members fade out once done and the view zooms to the
   ministers, then to the leader for the verdict;
 - click any node to jump to that seat's full text in the transcript below.
+
+Past sessions are listed under **Archive**; click one to read it back.
 
 ## Setup
 
@@ -89,6 +99,21 @@ python -m council.models nemotron     # filtered, and flags any seat pointing at
 python -m council --port 9000 --reload
 ```
 
+## Tests
+
+```powershell
+pip install -r requirements-dev.txt
+python -m pytest
+```
+
+The suite covers the pure logic — artifact extraction, JSON recovery from model
+replies, seat labelling, roster loading, payload clamping — plus every protocol
+driven end to end against a scripted fake endpoint, so no test touches the
+network. The protocol tests assert the failure behaviour the council promises:
+a dead seat never ends a session, a failed leader hands the verdict to the
+fastest seat that did answer, and the handoff chain re-routes past a seat that
+drops the ticket.
+
 ## Layout
 
 | Path | What it is |
@@ -100,6 +125,7 @@ python -m council --port 9000 --reload
 | `council/protocol.py` | Runs a protocol, emits the event stream |
 | `council/server.py` | FastAPI: config, model list, NDJSON deliberation stream, transcripts |
 | `council/static/` | The UI: HUD page, protocol diagrams, live council floor |
+| `tests/` | pytest suite, no network |
 | `transcripts/` | Every session, saved as JSON + Markdown |
 
 ## Notes
@@ -113,8 +139,23 @@ python -m council --port 9000 --reload
   the chain of thought into `content`. That is caught and reported as
   "token limit hit" instead of being passed off as an answer.
 - **Failures are contained.** One seat erroring does not end the session; its
-  card shows the error and the council continues without it.
-- **Cost and time.** 14 seats under Debate is ~29 model calls. Fan-out is 15.
-  Untick seats in the roster, or pick a cheaper protocol, when you just want a
-  quick answer.
-# Ai_council
+  card shows the error and the council continues without it. If the leader
+  itself fails, the fastest seat that already answered writes the verdict.
+- **Concurrency.** At most 6 seats stream at once. Fanning a full roster out
+  unthrottled is the quickest way to trip the per-key rate limit, and a 429
+  costs a whole seat's turn.
+- **Cost and time.** 12 seats under Debate is ~25 model calls; fan-out is 13.
+  The footer reports calls and tokens for every session (estimated from
+  characters when the endpoint does not report usage). Untick seats in the
+  roster, or pick a cheaper protocol, when you just want a quick answer.
+- **A session is capped at 15 minutes**, after which it is stopped and reported.
+
+## Security
+
+There is **no authentication on any route**. It binds `127.0.0.1` by default,
+which is the only configuration you should treat as safe. Anyone who can reach
+the port can spend your `NVIDIA_API_KEY`, and because the roster is sent by the
+browser, they also choose which models it is spent on. `max_tokens`,
+`reasoning_budget`, `temperature` and `top_p` are clamped server-side to bound
+the damage, but that is a backstop, not a control. Passing `--host 0.0.0.0`
+prints a warning; do it only on a network you trust.

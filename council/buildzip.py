@@ -3,17 +3,13 @@
 When the council was asked to build something, the leader's verdict typically
 contains one or more fenced code blocks. This pulls them out under whatever
 filename the model gave them (a heading, a `**File:** ...` line, or a name in
-the fence's info string), falling back to a generic name per language, and
-packs the result into a zip next to the saved transcript.
+the fence's info string), falling back to a generic name per language. The
+browser packs the result into a zip client-side (see static/zip.js).
 """
 
 from __future__ import annotations
 
-import io
 import re
-import zipfile
-from pathlib import PurePosixPath
-from typing import Any
 
 FENCE_RE = re.compile(r"```([^\n`]*)\n(.*?)\n?```", re.S)
 
@@ -22,7 +18,7 @@ FILENAME_TOKEN = re.compile(r"^[\w][\w./\\-]{0,119}\.[A-Za-z0-9]{1,10}$")
 
 # A hint line just above a fence: **File:** `x`, File: x, **`x`**, `x`, ### x
 HINT_PATTERNS = [
-    re.compile(r"^\*{0,2}file\*{0,2}\s*:\s*`?([^`\s][^`]*?)`?\s*$", re.I),
+    re.compile(r"^\*{0,2}file\*{0,2}\s*:\s*\*{0,2}\s*`?([^`\s][^`]*?)`?\s*\*{0,2}\s*$", re.I),
     re.compile(r"^\*{0,2}`([^`\s][^`]*)`\*{0,2}\s*$"),
     re.compile(r"^#{1,6}\s+`?([^\s`][^`]*?)`?\s*$"),
 ]
@@ -36,7 +32,11 @@ EXT_FOR_LANG = {
     "csharp": "cs", "cs": "cs", "ruby": "rb", "php": "php", "swift": "swift",
     "kotlin": "kt", "dockerfile": "Dockerfile", "text": "txt", "plaintext": "txt",
     "markdown": "md", "md": "md", "xml": "xml", "ini": "ini", "env": "env",
+    "makefile": "Makefile", "make": "Makefile",
 }
+
+# Languages whose conventional filename *is* the token above, with no extension.
+EXTENSIONLESS = {"Dockerfile", "Makefile"}
 
 
 def _sanitize(name: str) -> str:
@@ -103,7 +103,11 @@ def extract_files(markdown: str) -> dict[str, str]:
             ext = EXT_FOR_LANG.get(lang, lang if re.match(r"^[a-z0-9]{1,10}$", lang) else "txt")
             generic_counts[ext] = generic_counts.get(ext, 0) + 1
             n = generic_counts[ext]
-            name = f"file{n}.{ext}" if n > 1 or len(EXT_FOR_LANG) else f"file.{ext}"
+            # Extension-only names ("Dockerfile", "Makefile") are the filename.
+            if ext in EXTENSIONLESS:
+                name = ext if n == 1 else f"{ext}.{n}"
+            else:
+                name = f"file.{ext}" if n == 1 else f"file{n}.{ext}"
 
         name = _sanitize(name)
         if not name:
@@ -114,22 +118,6 @@ def extract_files(markdown: str) -> dict[str, str]:
         files[name] = body
 
     return files
-
-
-def zip_bytes(files: dict[str, str]) -> bytes:
-    buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-        for name, content in files.items():
-            zf.writestr(PurePosixPath(name).as_posix(), content)
-    return buf.getvalue()
-
-
-def build_zip(transcript: dict[str, Any]) -> tuple[dict[str, str], bytes | None]:
-    """Extract files from a transcript's verdict and zip them if there are any."""
-    files = extract_files(transcript.get("verdict", ""))
-    if not files:
-        return {}, None
-    return files, zip_bytes(files)
 
 
 # Only offer a zip when the question itself asked for something to be built —

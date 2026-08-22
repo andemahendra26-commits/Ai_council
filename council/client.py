@@ -47,8 +47,12 @@ async def stream_chat(
     client: AsyncOpenAI,
     seat: Seat,
     messages: list[dict[str, str]],
-) -> AsyncIterator[tuple[str, str]]:
-    """Yield ("reasoning" | "content" | "finish", text) deltas for one seat's turn.
+) -> AsyncIterator[tuple[str, Any]]:
+    """Yield ("reasoning" | "content" | "finish" | "usage", value) for one turn.
+
+    All kinds carry a string except "usage", which carries the endpoint's token
+    dict when it volunteers one on the final chunk (NIM usually does; we never
+    ask for it via stream_options, because some deployments reject that field).
 
     Reasoning models on NIM emit their chain of thought on `reasoning_content`
     and the answer on `content`; models without thinking only ever emit the
@@ -81,6 +85,10 @@ async def stream_chat(
         stream = await client.chat.completions.create(**kwargs)
 
     async for chunk in stream:
+        usage = getattr(chunk, "usage", None)
+        if usage is not None:
+            data = usage.model_dump() if hasattr(usage, "model_dump") else dict(usage)
+            yield "usage", {k: v for k, v in data.items() if isinstance(v, int)}
         if not chunk.choices:
             continue
         choice = chunk.choices[0]
@@ -96,7 +104,6 @@ async def stream_chat(
 
 
 async def list_models(client: AsyncOpenAI) -> list[str]:
-    """Model IDs this API key can actually reach, chat-capable ones first."""
+    """Model IDs this API key can actually reach, sorted alphabetically."""
     page = await client.models.list()
-    ids = sorted(m.id for m in page.data)
-    return ids
+    return sorted(m.id for m in page.data)

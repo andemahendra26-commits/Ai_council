@@ -16,6 +16,12 @@ ROOT = Path(__file__).resolve().parent.parent
 
 RANKS = ("leader", "minister", "member")
 
+# The browser sends whole seat dicts back, so max_tokens is attacker-controlled
+# on any non-loopback bind. Clamp it: without a ceiling a caller could bill the
+# operator's API key for an arbitrarily long generation on every seat.
+MAX_TOKENS_CEILING = 32768
+MIN_TOKENS = 64
+
 
 @dataclass
 class Seat:
@@ -65,12 +71,17 @@ DEFAULT_SEATS: list[Seat] = [
         color="#8b95ff",
         temperature=0.7, top_p=0.95, max_tokens=12288,
     ),
+    # Benched by default *because* it is the chair's model (see DEFAULT_CHAIR).
+    # Seating it too would put the same model on both sides of the verdict —
+    # the leader would be weighing an argument it had also made itself, which
+    # defeats the point of a mixed-lineage council. Tick it on only if you
+    # re-point the chair at something else.
     Seat(
         id="glm52",
         name="GLM-5.2",
         model="z-ai/glm-5.2",
         color="#5ad1c8",
-        temperature=0.7, top_p=0.95, max_tokens=12288,
+        temperature=0.7, top_p=0.95, max_tokens=12288, enabled=False,
     ),
     Seat(
         id="super120",
@@ -443,10 +454,19 @@ def load_config(path: str | os.PathLike[str] | None = None) -> CouncilConfig:
     return cfg
 
 
+def clamp_seat(seat: Seat) -> Seat:
+    """Bring a client-supplied seat back inside sane generation limits."""
+    seat.max_tokens = max(MIN_TOKENS, min(int(seat.max_tokens), MAX_TOKENS_CEILING))
+    seat.reasoning_budget = max(0, min(int(seat.reasoning_budget), MAX_TOKENS_CEILING))
+    seat.temperature = max(0.0, min(float(seat.temperature), 2.0))
+    seat.top_p = max(0.01, min(float(seat.top_p), 1.0))
+    return seat
+
+
 def seats_from_payload(payload: list[dict[str, Any]] | None, cfg: CouncilConfig) -> list[Seat]:
     """Turn a UI payload (possibly partial seat dicts) into Seats."""
     if not payload:
-        return cfg.enabled_seats()
+        return [clamp_seat(s) for s in cfg.enabled_seats()]
     by_id = {s.id: s for s in cfg.seats}
     seats = [_seat_from(s, by_id.get(s.get("id", ""))) for s in payload]
-    return [s for s in seats if s.enabled]
+    return [clamp_seat(s) for s in seats if s.enabled]

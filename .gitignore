@@ -6,3 +6,5 @@ council.json
 transcripts/
 .playwright-mcp/
 *.png
+.pytest_cache/
+requirements-dev.txt.lock

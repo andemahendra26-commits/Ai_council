@@ -48,9 +48,12 @@ J_EMIT = """```json
 
 
 def _adv(ctx: Ctx, seat: Seat, extra: str = "") -> str:
+    # A seat's persona, when it has one, goes in right after its standing, so
+    # the flavour colours the whole turn rather than trailing the instructions.
+    persona = f" {seat.persona.strip()}" if seat.persona and seat.persona.strip() else ""
     return (
-        f"{ctx.rank_brief(seat)} The council exists to answer one question as well as it "
-        f"can possibly be answered. {extra} {STYLE}"
+        f"{ctx.rank_brief(seat)}{persona} The council exists to answer one question as "
+        f"well as it can possibly be answered. {extra} {STYLE}"
     )
 
 
@@ -145,7 +148,7 @@ async def run_orchestration(ctx: Ctx) -> str:
         _chair(ctx, "Your workers have returned. Assemble their output into the answer, "
                     "fixing any gap or contradiction between them. " + FINAL_SHAPE),
         f"QUESTION:\n\n{ctx.question}\n\nYOUR PLAN:\n\n{plan.get(ctx.chair.id, '')}\n\n"
-        f"WORKER OUTPUT:\n\n{Ctx.block(work, ctx.seats, ctx)}",
+        f"WORKER OUTPUT:\n\n{ctx.block(work)}",
         "Step 3 — Orchestrator assembles",
     )
 
@@ -204,14 +207,18 @@ async def run_handoff(ctx: Ctx) -> str:
 
     seen: set[str] = set()
     answer, holder = "", current
-    for hop in range(1, min(len(ctx.seats), 3) + 1):
-        if current.id in seen:
-            break
+    # `held` counts seats that actually worked the ticket; `attempt` counts
+    # every seat it was offered to. A seat that errors out costs an attempt but
+    # not a hop, so one dead model cannot spend the whole routing budget.
+    max_hops = min(len(ctx.seats), 3)
+    held = attempt = 0
+    while held < max_hops and current is not None and current.id not in seen:
+        attempt += 1
         seen.add(current.id)
-        await ctx.note(f"Handed to {ctx.label(current)} — {current.name}", f"hop{hop}")
+        await ctx.note(f"Handed to {ctx.label(current)} — {current.name}", f"hop{attempt}")
         got = await ctx.stage(
-            f"hop{hop}",
-            f"Hop {hop} — {ctx.label(current)} holds the ticket",
+            f"hop{attempt}",
+            f"Hop {attempt} — {ctx.label(current)} holds the ticket",
             [(
                 current,
                 _adv(ctx, current,
@@ -226,7 +233,25 @@ async def run_handoff(ctx: Ctx) -> str:
             )],
             solo=True,
         )
-        answer, holder = got.get(current.id, ""), current
+        worked = got.get(current.id, "")
+        # A terse reply is still a reply; only an outright error (speak returns
+        # "") or an out-of-budget placeholder counts as the holder dropping it.
+        if not is_usable(worked, min_chars=1):
+            # The holder failed outright, or never reached an answer. Breaking
+            # here would hand the leader an empty ticket and call it resolved,
+            # so pass it to a seat that has not held it yet instead.
+            nxt = next((s for s in ctx.seats if s.id not in seen), None)
+            if nxt is None:
+                break
+            await ctx.note(
+                f"{ctx.label(current)} did not answer - re-routing to {ctx.label(nxt)}.",
+                f"hop{attempt}",
+            )
+            current = nxt
+            continue
+
+        held += 1
+        answer, holder = worked, current
         decision = extract_json(answer) or {}
         nxt = ctx.by_label(decision.get("handoff_to"))
         if decision.get("resolved", True) or not nxt or nxt.id in seen:
@@ -307,7 +332,7 @@ async def run_fanout(ctx: Ctx) -> str:
         ctx,
         _chair(ctx, "Independent answers came back in parallel. Merge them into one. "
                     "Where they collide, decide. " + FINAL_SHAPE),
-        f"QUESTION:\n\n{ctx.question}\n\nINDEPENDENT ANSWERS:\n\n{Ctx.block(answers, ctx.seats, ctx)}",
+        f"QUESTION:\n\n{ctx.question}\n\nINDEPENDENT ANSWERS:\n\n{ctx.block(answers)}",
     )
 
 
@@ -355,7 +380,7 @@ async def run_supervisor(ctx: Ctx) -> str:
             _chair(ctx, "Review each specialist's report against your brief. Be hard: "
                         "accept only what is actually usable, and send back anything "
                         "thin, wrong or off-brief with specific feedback."),
-            f"BRIEF:\n\n{brief_text}\n\nREPORTS:\n\n{Ctx.block(work, ctx.seats, ctx)}\n\n"
+            f"BRIEF:\n\n{brief_text}\n\nREPORTS:\n\n{ctx.block(work)}\n\n"
             f"Short review per specialist, then:\n{J_REVIEW}",
         )],
         solo=True,
@@ -390,7 +415,7 @@ async def run_supervisor(ctx: Ctx) -> str:
         _chair(ctx, "Your specialists have delivered. Write the answer you are "
                     "accountable for. " + FINAL_SHAPE),
         f"QUESTION:\n\n{ctx.question}\n\nBRIEF:\n\n{brief_text}\n\n"
-        f"ACCEPTED WORK:\n\n{Ctx.block(work, ctx.seats, ctx)}",
+        f"ACCEPTED WORK:\n\n{ctx.block(work)}",
         "Manager's answer",
     )
 
@@ -432,7 +457,7 @@ async def run_debate(ctx: Ctx) -> str:
                      "say what changed; hold your ground where it does not and say why "
                      "the objection fails."),
                 f"QUESTION:\n\n{ctx.question}\n\nYOUR OPENING:\n\n{openings.get(s.id, '')}\n\n"
-                f"THE OTHER SEATS' OPENINGS:\n\n{Ctx.block(openings, ctx.seats, ctx, skip=s.id)}",
+                f"THE OTHER SEATS' OPENINGS:\n\n{ctx.block(openings, skip=s.id)}",
             ) for s in ctx.seats],
         )
 
@@ -440,8 +465,8 @@ async def run_debate(ctx: Ctx) -> str:
         ctx,
         _chair(ctx, "The council opened and then cross-examined each other. " + FINAL_SHAPE),
         f"QUESTION:\n\n{ctx.question}\n\n=== ROUND 1 — OPENINGS ===\n\n"
-        f"{Ctx.block(openings, ctx.seats, ctx)}\n\n=== ROUND 2 — CROSS-EXAMINATION ===\n\n"
-        f"{Ctx.block(critiques, ctx.seats, ctx) if critiques else '(skipped)'}",
+        f"{ctx.block(openings)}\n\n=== ROUND 2 — CROSS-EXAMINATION ===\n\n"
+        f"{ctx.block(critiques) if critiques else '(skipped)'}",
         "Round 3 — Verdict",
     )
 
@@ -518,7 +543,7 @@ async def run_hierarchical(ctx: Ctx) -> str:
                                   "risk you are escalating."),
             f"QUESTION:\n\n{ctx.question}\n\nSTREAM GOAL:\n\n{st['goal']}\n\n"
             f"YOUR WORKERS' OUTPUT:\n\n"
-            f"{Ctx.block(worker_out, st['workers'], ctx) if st['workers'] else '(you have no workers — do the work yourself)'}",
+            f"{ctx.block(worker_out, st['workers']) if st['workers'] else '(you have no workers — do the work yourself)'}",
         ) for st in streams],
     )
 
@@ -526,7 +551,7 @@ async def run_hierarchical(ctx: Ctx) -> str:
         ctx,
         _chair(ctx, "Your leads have reported up. Decide. " + FINAL_SHAPE),
         f"QUESTION:\n\n{ctx.question}\n\nSTREAM REPORTS:\n\n"
-        f"{Ctx.block(lead_out, [st['lead'] for st in streams], ctx)}",
+        f"{ctx.block(lead_out, [st['lead'] for st in streams])}",
         "Tier 1 — Director's decision",
     )
 

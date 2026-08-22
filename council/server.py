@@ -74,6 +74,47 @@ async def api_models() -> JSONResponse:
         await client.close()
 
 
+# A saved transcript's stem, exactly as _save_transcript() builds it:
+# YYYYmmdd-HHMMSS-slug. Anything else is refused rather than resolved, so no
+# client-supplied string ever reaches the filesystem.
+TRANSCRIPT_STEM = re.compile(r"^\d{8}-\d{6}-[a-z0-9-]{0,48}$")
+
+
+@app.get("/api/transcripts")
+async def api_transcripts() -> JSONResponse:
+    """Past sessions, newest first, for the archive drawer."""
+    if not TRANSCRIPTS.is_dir():
+        return JSONResponse({"transcripts": []})
+    rows = []
+    for path in sorted(TRANSCRIPTS.glob("*.json"), reverse=True)[:200]:
+        if not TRANSCRIPT_STEM.match(path.stem):
+            continue
+        row = {"name": path.stem, "question": path.stem, "pattern": "", "elapsed": None}
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            rows.append(row)  # keep the entry; it is still on disk
+            continue
+        row["question"] = data.get("question") or path.stem
+        row["pattern"] = (data.get("pattern") or {}).get("name", "")
+        row["elapsed"] = data.get("elapsed")
+        row["usage"] = data.get("usage")
+        row["seats"] = len(data.get("seats") or [])
+        rows.append(row)
+    return JSONResponse({"transcripts": rows})
+
+
+@app.get("/api/transcripts/{name}")
+async def api_transcript(name: str) -> JSONResponse:
+    """One saved session, as the rendered Markdown record."""
+    if not TRANSCRIPT_STEM.match(name):
+        return JSONResponse({"error": "Not a transcript name."}, status_code=400)
+    path = TRANSCRIPTS / f"{name}.md"
+    if not path.is_file():
+        return JSONResponse({"error": "No such transcript."}, status_code=404)
+    return JSONResponse({"name": name, "markdown": path.read_text(encoding="utf-8")})
+
+
 @app.post("/api/deliberate")
 async def api_deliberate(request: Request) -> StreamingResponse:
     body: dict[str, Any] = await request.json()
@@ -157,6 +198,17 @@ def _save_transcript(transcript: dict[str, Any]) -> str:
     lines += ["| Seat | Model |", "| --- | --- |"]
     lines += [f"| {s['label']} — {s['name']} | `{s['model']}` |" for s in transcript["seats"]]
     lines += [f"| Chair — {transcript['chair']['name']} | `{transcript['chair']['model']}` |", ""]
+    usage = transcript.get("usage") or {}
+    if usage:
+        tokens = usage.get("tokens") or {}
+        approx = "~" if usage.get("tokens_estimated") else ""
+        lines += [
+            f"**Cost:** {usage.get('calls', 0)} model calls"
+            + (f", {usage['failures']} failed" if usage.get("failures") else "")
+            + (f" · {approx}{tokens.get('total_tokens', 0):,} tokens" if tokens else "")
+            + (f" · {transcript['elapsed']}s" if transcript.get("elapsed") else ""),
+            "",
+        ]
     lines += ["---", "", "## Verdict", "", transcript["verdict"] or "_(no verdict)_", ""]
     lines += ["---", "", "## Full record", ""]
     for entry in transcript.get("log", []):
